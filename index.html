@@ -365,7 +365,6 @@ function excelDateToJS(value) {
     totalSeconds -= seconds;
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor(totalSeconds / 60) % 60;
-    // UTC 고정: 로컬 타임존 오프셋 제거
     return new Date(Date.UTC(dateInfo.getUTCFullYear(), dateInfo.getUTCMonth(), dateInfo.getUTCDate(), hours, minutes, seconds));
   }
   if (typeof value === 'string') {
@@ -620,66 +619,97 @@ async function applyDl() {
     const sorted = [...pRows].sort((a, b) => rawDateMs(a.row[8]) - rawDateMs(b.row[8]));
     if (!sorted.length) { msgEl.textContent = '추가할 행이 없습니다.'; return; }
 
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(f2Buf);
-    const worksheet = findExcelTrackerSheet(workbook, year);
-    if (!worksheet) throw new Error(`${year}년 시트를 찾지 못했습니다.`);
+    // ExcelJS 대신 XLSX.js 사용 → VBA·슬라이서·피벗 등 원본 구조 그대로 보존
+    const wb2 = XLSX.read(f2Buf, { type: 'array', bookVBA: true, cellStyles: true });
+    const sn = wb2.SheetNames.find(s => s.includes(String(year)));
+    if (!sn) throw new Error(`${year}년 시트를 찾지 못했습니다.`);
+    const ws = wb2.Sheets[sn];
 
-    const meta = buildExcelTrackerMeta(worksheet);
-    let nextSeq = meta.lastNumber;
-    const templateRow = worksheet.getRow(meta.lastRealDataRow);
-    const writeStartRow = meta.startWriteRow;
-    const maxCols = Math.max(26, worksheet.columnCount || 26);
+    // 현재 범위 파악 + 마지막 번호·행 탐색
+    const range = XLSX.utils.decode_range(ws['!ref'] || 'A1:Z8');
+    let lastDataRowIdx = 6; // 0-based (row 7 = 헤더)
+    let nextSeq = 0;
+    for (let r = 7; r <= range.e.r; r++) {
+      const cell = ws[XLSX.utils.encode_cell({ r, c: 0 })];
+      if (cell && cell.v !== undefined && cell.v !== '' && !isNaN(+cell.v)) {
+        lastDataRowIdx = r;
+        nextSeq = Math.max(nextSeq, +cell.v);
+      }
+    }
+    const startRowIdx = lastDataRowIdx + 1; // 새 행 시작 위치 (0-based)
+
+    // 날짜 → Excel 시리얼 변환 (UTC 고정)
+    function toSerial(v) {
+      const d = excelDateToJS(v);
+      if (!d) return null;
+      const epoch = Date.UTC(1899, 11, 30);
+      return (d.getTime() - epoch) / 86400000;
+    }
+
+    // 셀 쓰기 헬퍼
+    function S(ri, ci, value, fmt) {
+      const addr = XLSX.utils.encode_cell({ r: ri, c: ci });
+      if (value === null || value === undefined || value === '') {
+        ws[addr] = { t: 's', v: '' };
+      } else if (typeof value === 'boolean') {
+        ws[addr] = { t: 'b', v: value };
+      } else if (typeof value === 'number') {
+        const cell = { t: 'n', v: value };
+        if (fmt) cell.z = fmt;
+        ws[addr] = cell;
+      } else {
+        ws[addr] = { t: 's', v: String(value) };
+      }
+    }
 
     for (let i = 0; i < sorted.length; i++) {
       const pr = sorted[i];
-      const r = pr.row;
-      const targetRowNo = writeStartRow + i;
-      const targetRow = worksheet.getRow(targetRowNo);
-      targetRow.height = templateRow.height;
-
-      for (let col = 1; col <= maxCols; col++) {
-        copyExcelCellStyle(templateRow.getCell(col), targetRow.getCell(col));
-      }
-
+      const r  = pr.row;
+      const ri = startRowIdx + i;
       pr.seq = ++nextSeq;
-      const agg = false; // 항상 False 고정
 
-      setExcelCellValueSmart(targetRow.getCell(1), pr.seq);
-      setExcelCellValueSmart(targetRow.getCell(2), year);
-      setExcelCellValueSmart(targetRow.getCell(3), MONTH_NAMES[month - 1]);
-      setExcelCellValueSmart(targetRow.getCell(4), pr.entry.iata || '');
-      setExcelCellValueSmart(targetRow.getCell(5), '');
-      setExcelCellValueSmart(targetRow.getCell(6), r[0] || '');
-      setExcelCellValueSmart(targetRow.getCell(7), '');
-      setExcelCellValueSmart(targetRow.getCell(8), pr.entry.agency || '');
-      setExcelCellValueSmart(targetRow.getCell(9), '02-ICON');
-      setExcelCellValueSmart(targetRow.getCell(10), agg);
-      setExcelCellValueSmart(targetRow.getCell(11), r[2] || '');
-      setExcelCellValueSmart(targetRow.getCell(12), pr.oid);
-      setExcelCellValueSmart(targetRow.getCell(13), r[4] || '');
-      setExcelCellValueSmart(targetRow.getCell(14), excelDateToJS(r[5]) || fmtD(r[5]) || '');
-      setExcelCellValueSmart(targetRow.getCell(15), r[6] || '');
-      setExcelCellValueSmart(targetRow.getCell(16), r[7] || '');
-      setExcelCellValueSmart(targetRow.getCell(17), excelDateToJS(r[8]) || fmtD(r[8]) || '');
-      setExcelCellValueSmart(targetRow.getCell(18), 'Y');
-      setExcelCellValueSmart(targetRow.getCell(19), 0);
-      setExcelCellValueSmart(targetRow.getCell(20), 'Standard');
-      setExcelCellValueSmart(targetRow.getCell(21), 'N');
-      setExcelCellValueSmart(targetRow.getCell(22), '');
-      setExcelCellValueSmart(targetRow.getCell(23), '');
-      setExcelCellValueSmart(targetRow.getCell(24), '');
-      setExcelCellValueSmart(targetRow.getCell(25), '');
-      setExcelCellValueSmart(targetRow.getCell(26), '');
-      targetRow.commit();
+      const depSerial = toSerial(r[5]);
+      const pubSerial = toSerial(r[8]);
+      const dateFmt   = 'dd-mmm-yy';
+
+      S(ri,  0, pr.seq);
+      S(ri,  1, year);
+      S(ri,  2, MONTH_NAMES[month - 1]);
+      S(ri,  3, pr.entry.iata || '');
+      S(ri,  4, '');
+      S(ri,  5, r[0] || '');
+      S(ri,  6, '');
+      S(ri,  7, pr.entry.agency || '');
+      S(ri,  8, '02-ICON');
+      S(ri,  9, false);                          // Aggregated: 항상 false
+      S(ri, 10, r[2] || '');
+      S(ri, 11, pr.oid);
+      S(ri, 12, r[4] || '');
+      if (depSerial) S(ri, 13, depSerial, dateFmt); else S(ri, 13, fmtD(r[5]) || '');
+      S(ri, 14, r[6] || '');
+      S(ri, 15, r[7] || '');
+      if (pubSerial) S(ri, 16, pubSerial, dateFmt); else S(ri, 16, fmtD(r[8]) || '');
+      S(ri, 17, 'Y');
+      S(ri, 18, 0);
+      S(ri, 19, 'Standard');
+      S(ri, 20, 'N');
+      S(ri, 21, '');
+      S(ri, 22, '');
+      S(ri, 23, '');
+      S(ri, 24, '');
+      S(ri, 25, '');
+
+      if (ri > range.e.r) range.e.r = ri;
     }
+    ws['!ref'] = XLSX.utils.encode_range(range);
 
-    const out = await workbook.xlsx.writeBuffer();
+    // bookVBA:true → VBA·슬라이서·피벗 원본 보존하여 저장
+    const out = XLSX.write(wb2, { type: 'array', bookType: 'xlsx', bookVBA: true });
     await idbSet(out);
 
     const fname = `ADP_Report_${year}_${MONTH_NAMES[month-1]}_updated.xlsx`;
     dlFile(out, fname);
-    msgEl.innerHTML = `<span style="color:var(--green)">✅ ${sorted.length}건을 Published date 순으로 정렬해 기존 데이터 바로 아래에 추가했습니다. 이번 버전은 v2처럼 기존 마지막 실제 데이터 행의 서식을 그대로 복제해서 새 행을 작성하므로 기존 월별 데이터와 동일한 형식을 최대한 유지합니다. "${fname}" 다운로드됩니다.</span>`;
+    msgEl.innerHTML = `<span style="color:var(--green)">✅ ${sorted.length}건 추가 완료 (Published date 순). "${fname}" 다운로드됩니다.</span>`;
     refreshStat();
   } catch (e) {
     msgEl.innerHTML = `<span style="color:var(--red)">❌ 오류: ${e.message}</span>`;
